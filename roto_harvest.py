@@ -6,7 +6,7 @@ import csv
 from datetime import datetime
 import pytz
 
-TOKEN = '${DISCORD_TOKEN}'
+TOKEN = os.environ['DISCORD_TOKEN']
 CHANNEL_ID = 1381126985014710282
 SAVE_PATH = '/Users/jarvis/.openclaw/workspace/media/ml_mafia/winners/'
 EST = pytz.timezone('US/Eastern')

@@ -13,7 +13,7 @@ Harvests daily winner screenshots from the ML Mafia Discord channel and saves th
 ## Production Schedule
 
 ```
-0 7 * * * /usr/bin/python3 /Users/jarvis/.openclaw/workspace/roto-resource-service/roto_harvest.py >> /Users/jarvis/.openclaw/workspace/logs/roto-harvest.log 2>&1
+0 7 * * * DISCORD_TOKEN=<token> /usr/bin/python3 /Users/jarvis/.openclaw/workspace/roto-resource-service/roto_harvest.py >> /Users/jarvis/.openclaw/workspace/logs/roto-harvest.log 2>&1
 ```
 
 Runs at **7:00 AM EST daily**.
