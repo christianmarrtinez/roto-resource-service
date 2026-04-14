@@ -2,7 +2,6 @@ import asyncio
 import discord
 import os
 import aiohttp
-import csv
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,12 +14,14 @@ TOKEN       = os.environ['DISCORD_TOKEN']
 CHANNEL_ID  = 1381126985014710282
 SAVE_PATH   = Path('/Users/jarvis/.openclaw/workspace/media/ml_mafia/winners/')
 LOG_PATH    = Path('/Users/jarvis/.openclaw/workspace/logs/roto-harvest.log')
-WATCHLIST_PATH = Path('/Users/jarvis/.openclaw/workspace/tasks/repositories/tracked-twitter.md')
 EST         = pytz.timezone('US/Eastern')
 HISTORY_LIMIT   = 500
 LOOKBACK_HOURS  = 24
 MAX_RETRIES     = 3
 RETRY_DELAY_S   = 5   # base seconds between download retries
+
+# No watchlist filter — #made-men-winners is a winners-only channel;
+# all image attachments from any poster are harvested.
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 
@@ -33,22 +34,6 @@ logging.basicConfig(
 log = logging.getLogger('roto')
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
-
-def load_watchlist() -> set:
-    """Return set of tracked usernames from CSV. Returns empty set on any error."""
-    if not WATCHLIST_PATH.exists():
-        log.error('Watchlist not found: %s', WATCHLIST_PATH)
-        return set()
-    try:
-        with open(WATCHLIST_PATH, newline='') as f:
-            reader = csv.DictReader(f)
-            names = {row['Username'].strip() for row in reader if row.get('Username', '').strip()}
-        log.info('Watchlist loaded — %d usernames', len(names))
-        return names
-    except Exception as exc:
-        log.error('Failed to load watchlist: %s', exc)
-        return set()
-
 
 async def download_with_retry(session: aiohttp.ClientSession, url: str, dest: Path) -> bool:
     """Download url → dest with up to MAX_RETRIES attempts. Returns True on success."""
@@ -78,10 +63,6 @@ async def download_with_retry(session: aiohttp.ClientSession, url: str, dest: Pa
 
 async def main():
     log.info('=== Roto harvest started ===')
-
-    watchlist = load_watchlist()
-    if not watchlist:
-        log.warning('Empty watchlist — harvest will collect nothing. Continuing anyway.')
 
     intents = discord.Intents.default()
     intents.message_content = True
@@ -134,9 +115,6 @@ async def main():
                 if message.created_at < cutoff_utc:
                     break
 
-                if message.author.name not in watchlist:
-                    continue
-
                 for attachment in message.attachments:
                     if not any(attachment.filename.lower().endswith(ext)
                                for ext in ('.jpg', '.jpeg', '.png', '.gif')):
@@ -148,8 +126,12 @@ async def main():
                     dest_path = save_dir / dest_name
 
                     if dest_path.exists():
-                        log.info('Already exists, skipping: %s', dest_name)
-                        continue
+                        # Deduplicate same-minute posts
+                        idx = 2
+                        while (save_dir / f'{message.author.name}_{time_str}_{idx}.png').exists():
+                            idx += 1
+                        dest_path = save_dir / f'{message.author.name}_{time_str}_{idx}.png'
+                        dest_name = dest_path.name
 
                     ok = await download_with_retry(session, attachment.url, dest_path)
                     if ok:
