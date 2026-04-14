@@ -3,49 +3,170 @@ import discord
 import os
 import aiohttp
 import csv
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
+from pathlib import Path
+
 import pytz
 
-TOKEN = os.environ['DISCORD_TOKEN']
-CHANNEL_ID = 1381126985014710282
-SAVE_PATH = '/Users/jarvis/.openclaw/workspace/media/ml_mafia/winners/'
-EST = pytz.timezone('US/Eastern')
+# ─── Config ────────────────────────────────────────────────────────────────────
+
+TOKEN       = os.environ['DISCORD_TOKEN']
+CHANNEL_ID  = 1381126985014710282
+SAVE_PATH   = Path('/Users/jarvis/.openclaw/workspace/media/ml_mafia/winners/')
+LOG_PATH    = Path('/Users/jarvis/.openclaw/workspace/logs/roto-harvest.log')
+WATCHLIST_PATH = Path('/Users/jarvis/.openclaw/workspace/tasks/repositories/tracked-twitter.md')
+EST         = pytz.timezone('US/Eastern')
+HISTORY_LIMIT   = 500
+LOOKBACK_HOURS  = 24
+MAX_RETRIES     = 3
+RETRY_DELAY_S   = 5   # base seconds between download retries
+
+# ─── Logging ───────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    filename=str(LOG_PATH),
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+)
+log = logging.getLogger('roto')
+
+# ─── Helpers ───────────────────────────────────────────────────────────────────
+
+def load_watchlist() -> set:
+    """Return set of tracked usernames from CSV. Returns empty set on any error."""
+    if not WATCHLIST_PATH.exists():
+        log.error('Watchlist not found: %s', WATCHLIST_PATH)
+        return set()
+    try:
+        with open(WATCHLIST_PATH, newline='') as f:
+            reader = csv.DictReader(f)
+            names = {row['Username'].strip() for row in reader if row.get('Username', '').strip()}
+        log.info('Watchlist loaded — %d usernames', len(names))
+        return names
+    except Exception as exc:
+        log.error('Failed to load watchlist: %s', exc)
+        return set()
+
+
+async def download_with_retry(session: aiohttp.ClientSession, url: str, dest: Path) -> bool:
+    """Download url → dest with up to MAX_RETRIES attempts. Returns True on success."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    dest.write_bytes(await resp.read())
+                    return True
+                elif resp.status == 403:
+                    # CDN URL expired — not retryable
+                    log.warning('CDN URL expired (403) for %s — skipping', dest.name)
+                    return False
+                else:
+                    log.warning('Attempt %d/%d — HTTP %d for %s', attempt, MAX_RETRIES, resp.status, dest.name)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            log.warning('Attempt %d/%d — network error downloading %s: %s', attempt, MAX_RETRIES, dest.name, exc)
+
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(RETRY_DELAY_S * attempt)
+
+    log.error('All %d download attempts failed for %s', MAX_RETRIES, dest.name)
+    return False
+
+
+# ─── Main ──────────────────────────────────────────────────────────────────────
 
 async def main():
-    # Load watchlist from tracked-twitter.md
-    watchlist = set()
-    with open('/Users/jarvis/.openclaw/workspace/tasks/repositories/tracked-twitter.md', 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row['Username']:
-                watchlist.add(row['Username'])
+    log.info('=== Roto harvest started ===')
 
-    intents = discord.Intents.all()
-    async with discord.Client(intents=intents) as client:
+    watchlist = load_watchlist()
+    if not watchlist:
+        log.warning('Empty watchlist — harvest will collect nothing. Continuing anyway.')
+
+    intents = discord.Intents.default()
+    intents.message_content = True
+
+    client = discord.Client(intents=intents)
+    saved  = 0
+    errors = 0
+
+    try:
         await client.login(TOKEN)
+    except discord.LoginFailure as exc:
+        log.error('Discord login failed: %s', exc)
+        return
+    except Exception as exc:
+        log.error('Unexpected error during login: %s', exc)
+        return
+
+    try:
         channel = await client.fetch_channel(CHANNEL_ID)
+    except discord.Forbidden:
+        log.error('Bot lacks permission to access channel %d', CHANNEL_ID)
+        await client.close()
+        return
+    except discord.NotFound:
+        log.error('Channel %d not found', CHANNEL_ID)
+        await client.close()
+        return
+    except Exception as exc:
+        log.error('Failed to fetch channel %d: %s', CHANNEL_ID, exc)
+        await client.close()
+        return
 
-        today = datetime.now(EST).strftime('%Y-%m-%d')
-        full_path = os.path.join(SAVE_PATH, today)
-        if not os.path.exists(full_path):
-            os.makedirs(full_path)
+    today       = datetime.now(EST).strftime('%Y-%m-%d')
+    save_dir    = SAVE_PATH / today
+    cutoff_utc  = datetime.now(pytz.utc) - timedelta(hours=LOOKBACK_HOURS)
 
-        async for message in channel.history(limit=500):
-            # AND LOGIC: Must be in watchlist AND posted in last 24h
-            if message.author.name in watchlist and (datetime.now(pytz.utc) - message.created_at).total_seconds() < 86400:
+    try:
+        save_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error('Cannot create save directory %s: %s', save_dir, exc)
+        await client.close()
+        return
+
+    log.info('Saving to: %s', save_dir)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async for message in channel.history(limit=HISTORY_LIMIT, oldest_first=False):
+                # Skip messages outside the lookback window
+                if message.created_at < cutoff_utc:
+                    break
+
+                if message.author.name not in watchlist:
+                    continue
+
                 for attachment in message.attachments:
-                    if any(attachment.filename.lower().endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif']):
-                        est_time = message.created_at.astimezone(EST)
-                        time_str = est_time.strftime('%I.%M%p')
-                        new_filename = f'{message.author.name}_{time_str}.png'
-                        file_path = os.path.join(full_path, new_filename)
+                    if not any(attachment.filename.lower().endswith(ext)
+                               for ext in ('.jpg', '.jpeg', '.png', '.gif')):
+                        continue
 
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(attachment.url) as resp:
-                                if resp.status == 200:
-                                    with open(file_path, 'wb') as f:
-                                        f.write(await resp.read())
+                    est_time  = message.created_at.astimezone(EST)
+                    time_str  = est_time.strftime('%I.%M%p')
+                    dest_name = f'{message.author.name}_{time_str}.png'
+                    dest_path = save_dir / dest_name
+
+                    if dest_path.exists():
+                        log.info('Already exists, skipping: %s', dest_name)
+                        continue
+
+                    ok = await download_with_retry(session, attachment.url, dest_path)
+                    if ok:
+                        log.info('Saved: %s', dest_name)
+                        saved += 1
+                    else:
+                        errors += 1
+
+    except discord.HTTPException as exc:
+        log.error('Discord API error while reading history: %s (status=%s)', exc.text, exc.status)
+    except Exception as exc:
+        log.error('Unexpected error during harvest: %s', exc, exc_info=True)
+    finally:
         await client.close()
 
-if __name__ == "__main__":
+    log.info('=== Roto harvest complete — saved: %d, errors: %d ===', saved, errors)
+
+
+if __name__ == '__main__':
     asyncio.run(main())
